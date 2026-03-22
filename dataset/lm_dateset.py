@@ -137,3 +137,132 @@ class SFTDataset(Dataset):
         #     print(f"{i:3d}: X={self.tokenizer.decode([x])!r:16s} ---> Y={self.tokenizer.decode([input_ids[i+1]])!r:16s} label={y}")
         # # ================
         return torch.tensor(input_ids, dtype=torch.long), torch.tensor(labels, dtype=torch.long)
+
+class DPODataset(Dataset):
+    def __init__(self, file_path, tokenizer, max_length=4096):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.padding = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+        self.bos_id = tokenizer(f'{tokenizer.bos_token}assistant\n', add_special_tokens=False).input_ids
+        self.eos_id = tokenizer(f'{tokenizer.eos_token}\n', add_special_tokens=False).input_ids
+        self.samples = load_dataset('json', data_files=file_path, split='train')
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        sample = self.samples[index]
+
+        chosen = sample['chosen']  # 是一个 list，里面包含若干 {role, content}
+        rejected = sample['rejected']  # 同上
+
+        #将 chosen和rejected 对话历史转换为模型可读的格式化字符串。
+        #tokenize=False：只转换为字符串，不转换为 token ID。
+        chosen_prompt = self.tokenizer.apply_chat_template(
+            chosen, tokenize=False, add_generation_prompt=False#
+        )
+        chosen_prompt = post_processing_chat(chosen_prompt)
+        rejected_prompt = self.tokenizer.apply_chat_template(
+            rejected, tokenize=False, add_generation_prompt=False
+        )
+        rejected_prompt = post_processing_chat(rejected_prompt)
+        
+        #将 chosen_prompt和rejected_encoding 转换为 token ID，并统一长度。
+        chosen_encoding = self.tokenizer(
+            chosen_prompt, truncation=True, max_length=self.max_length, padding='max_length'
+        )
+        rejected_encoding = self.tokenizer(
+            rejected_prompt, truncation=True, max_length=self.max_length, padding='max_length'
+        )
+
+        #保存 chosen 对应的 token ID 序列。
+        chosen_input_ids = chosen_encoding['input_ids']
+        #生成损失掩码，标记哪些位置是 “assistant 回复”（只计算这部分损失）。
+        chosen_loss_mask = self.generate_loss_mask(chosen_input_ids)
+        #保存 rejected 对应的 token ID 序列。
+        rejected_input_ids = rejected_encoding['input_ids']
+        #生成 rejected 对应的损失掩码。
+        rejected_loss_mask = self.generate_loss_mask(rejected_input_ids)
+        #去掉序列的最后一个 token并将列表转换为 PyTorch 长整型张量
+        x_chosen = torch.tensor(chosen_input_ids[:-1], dtype=torch.long)
+        y_chosen = torch.tensor(chosen_input_ids[1:], dtype=torch.long)
+        #构造损失掩码，对应目标输出的位置。
+        mask_chosen = torch.tensor(chosen_loss_mask[1:], dtype=torch.long)
+        #构造 rejected 对应的模型输入。
+        x_rejected = torch.tensor(rejected_input_ids[:-1], dtype=torch.long)
+        y_rejected = torch.tensor(rejected_input_ids[1:], dtype=torch.long)
+        #构造 rejected 对应的损失掩码。
+        mask_rejected = torch.tensor(rejected_loss_mask[1:], dtype=torch.long)
+
+        return {
+            'x_chosen': x_chosen,
+            'y_chosen': y_chosen,
+            'mask_chosen': mask_chosen,
+            'x_rejected': x_rejected,
+            'y_rejected': y_rejected,
+            'mask_rejected': mask_rejected
+        }
+
+    def generate_loss_mask(self, input_ids):
+        loss_mask = [0] * len(input_ids)
+        i = 0
+        while i < len(input_ids):
+            if input_ids[i:i + len(self.bos_id)] == self.bos_id:
+                start = i + len(self.bos_id)
+                end = start
+                while end < len(input_ids):
+                    if input_ids[end:end + len(self.eos_id)] == self.eos_id:
+                        break
+                    end += 1
+                for j in range(start, min(end + len(self.eos_id), self.max_length)):
+                    loss_mask[j] = 1
+                i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
+            else:
+                i += 1
+        return loss_mask
+    
+class RLAIFDataset(Dataset):
+    def __init__(self, jsonl_path, tokenizer, max_length=1024):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.samples = load_dataset('json', data_files=jsonl_path, split='train')
+        self.bos_id = tokenizer(f'{tokenizer.bos_token}assistant', add_special_tokens=False).input_ids
+        self.eos_id = tokenizer(f'{tokenizer.eos_token}', add_special_tokens=False).input_ids
+
+    def __len__(self):
+        return len(self.samples)
+
+    def create_chat_prompt(self, conversations):
+        messages = []
+        answer = ''
+        for i, turn in enumerate(conversations):
+            # 根据轮次索引奇偶性分配角色：偶数轮是 user，奇数轮是 assistant
+            role = 'user' if i % 2 == 0 else 'assistant'
+            # 将当前轮次整理为 Hugging Face 标准对话格式 {"role": "...", "content": "..."}，并添加到 messages
+            messages.append({"role": role, "content": turn['content']})
+             # 不断更新 answer，最终保存最后一轮对话的内容（即 assistant 的目标回复）
+            answer = turn['content']
+         # 使用分词器的 apply_chat_template 方法，将除最后一轮外的对话历史转换为模型可读的字符串
+        prompt = self.tokenizer.apply_chat_template(
+            messages[:-1],
+            tokenize=False,
+            add_generation_prompt=True  # 这里需要True
+        )
+        prompt = post_processing_chat(prompt)
+        return prompt, answer
+
+    def __getitem__(self, index):
+        sample = self.samples[index]
+        prompt, answer = self.create_chat_prompt(sample['conversations'])
+
+        return {
+            'prompt': prompt,
+            'answer': answer
+        }
+
+if __name__ == "__main__":
+    pass
+
+
