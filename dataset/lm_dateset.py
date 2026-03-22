@@ -6,6 +6,35 @@ from datasets import load_dataset
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+def pre_processing_chat(conversations, add_system_ratio=0.2):
+    ## 定义候选系统提示列表
+    SYSTEM_PROMPTS = [
+        "你是一个知识丰富的AI，尽力为用户提供准确的信息。",
+        "你是minimind，一个小巧但有用的语言模型。",
+        "你是一个专业的AI助手，请提供有价值的回答。",
+        "你是minimind，请尽力帮助用户解决问题。",
+        "你是一个可靠的AI，请给出准确的回答。",
+        "You are a helpful AI assistant.",
+        "You are minimind, a lightweight intelligent assistant.",
+        "You are a friendly chatbot. Please answer the user's questions carefully.",
+        "You are a knowledgeable AI. Try your best to provide accurate information.",
+        "You are minimind, a small but useful language model."
+    ]
+    #对话数据非空 + 第一条不是system角色（避免重复加system提示）
+    if conversations and conversations[0].get('role') != 'system':
+        #按20%的概率随机添加
+        if random.random() < add_system_ratio:
+            ## 随机选一个系统提示，插到对话最前面
+            return [{'role': 'system', 'content': random.choice(SYSTEM_PROMPTS)}] + conversations
+    # 不满足条件则返回原对话
+    return conversations
+
+#对话后处理，清理模块渲染后多余的空<think>块
+def post_processing_chat(prompt_content, empty_think_ratio=0.05):
+    if '<think>\n\n</think>\n\n' in prompt_content and random.random() > empty_think_ratio:
+        prompt_content = prompt_content.replace('<think>\n\n</think>\n\n', '')
+    return prompt_content
+
 class PretrainDataset(Dataset):
     def __init__(self, data_path, tokenizer, max_length=512):
         super().__init__()
@@ -37,3 +66,74 @@ class PretrainDataset(Dataset):
         labels[input_ids == self.tokenizer.pad_token_id] = -100
         
         return input_ids, labels
+    
+class SFTDataset(Dataset):
+    def __init__(self, jsonl_path, tokenizer, max_length=1024):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.max_length = max_length#输入序列最大长度
+        self.samples = load_dataset('json', data_files=jsonl_path, split='train')# 加载JSONL格式的对话数据集
+        self.bos_id = tokenizer(f'{tokenizer.bos_token}assistant\n', add_special_tokens=False).input_ids#预计算assistant开头的token id
+        self.eos_id = tokenizer(f'{tokenizer.eos_token}\n', add_special_tokens=False).input_ids  # 预计算结束符的token id
+
+    def __len__(self):
+        return len(self.samples)
+
+    def create_chat_prompt(self, conversations):
+        messages = conversations.copy()# 复制对话数据（避免修改原数据）
+        # 处理工具调用（可选）：如果第一条是system且包含functions，提取工具定义
+        tools = conversations[0]["functions"] if (
+            conversations 
+            and conversations[0]["role"] == "system" 
+            and conversations[0].get("functions")
+            ) else None
+        #  应用对话模板
+        return self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,#  先返回文本，不直接转token id
+            add_generation_prompt=False,# 不添加“生成提示”
+            tools=tools# 工具调用配置
+        )
+
+    def generate_labels(self, input_ids):
+         # 初始化labels：全为-100（PyTorch中-100表示该位置不计算损失）
+        labels = [-100] * len(input_ids)
+        i = 0
+        #滑动窗口，寻找回答部分，并回复本来的label
+        while i < len(input_ids):
+             # 找到assistant开头的位置（匹配self.bos_id）
+            if input_ids[i:i + len(self.bos_id)] == self.bos_id:
+                start = i + len(self.bos_id)
+                end = start
+                while end < len(input_ids):
+                    if input_ids[end:end + len(self.eos_id)] == self.eos_id:
+                        break
+                    end += 1
+                for j in range(start, min(end + len(self.eos_id), self.max_length)):
+                    labels[j] = input_ids[j]
+                i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
+            else:
+                i += 1
+        return labels
+
+    def __getitem__(self, index):
+        # 1. 加载单条样本
+        sample = self.samples[index]
+        # 2. 预处理：随机添加系统提示
+        conversations = pre_processing_chat(sample['conversations'])
+        # 3. 格式化对话为模型输入文本
+        prompt = self.create_chat_prompt(conversations)
+        # 4. 后处理：清理特殊占位符
+        prompt = post_processing_chat(prompt)
+        # 5. 文本转token id，截断到max_length
+        input_ids = self.tokenizer(prompt).input_ids[:self.max_length]
+        # 6. 补齐到max_length（不足部分用pad_token_id填充）
+        input_ids += [self.tokenizer.pad_token_id] * (self.max_length - len(input_ids))
+         # 7. 生成训练标签（仅标注assistant回答）
+        labels = self.generate_labels(input_ids)
+        # # === 调试打印 ===
+        # print(f"\n--- Sample {index} ---")
+        # for i, (x, y) in enumerate(zip(input_ids[:-1], labels[1:])):
+        #     print(f"{i:3d}: X={self.tokenizer.decode([x])!r:16s} ---> Y={self.tokenizer.decode([input_ids[i+1]])!r:16s} label={y}")
+        # # ================
+        return torch.tensor(input_ids, dtype=torch.long), torch.tensor(labels, dtype=torch.long)
