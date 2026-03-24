@@ -42,10 +42,14 @@ def calculate_rewards(prompts, responses, reward_model, reward_tokenizer):
 
         def mark_num(text):
             reward = 0
-            if text.count("<think>") == 1: reward += 0.25
-            if text.count("</think>") == 1: reward += 0.25
-            if text.count("<answer>") == 1: reward += 0.25
-            if text.count("</answer>") == 1: reward += 0.25
+            if text.count("<think>") == 1: 
+                reward += 0.25
+            if text.count("</think>") == 1: 
+                reward += 0.25
+            if text.count("<answer>") == 1: 
+                reward += 0.25
+            if text.count("</answer>") == 1: 
+                reward += 0.25
             return reward
 
         mark_rewards = [mark_num(response) for response in responses]
@@ -241,7 +245,8 @@ if __name__ == "__main__":
 
     # ========== 1. 初始化环境和随机种子 ==========
     local_rank = init_distributed_mode()
-    if dist.is_initialized(): args.device = f"cuda:{local_rank}"
+    if dist.is_initialized(): 
+        args.device = f"cuda:{local_rank}"
     setup_seed(42 + (dist.get_rank() if dist.is_initialized() else 0))
     
     # ========== 2. 配置目录、模型参数、检查ckp ==========
@@ -317,4 +322,5 @@ if __name__ == "__main__":
             grpo_train_epoch(epoch, loader, len(loader), ref_model, reward_model, reward_tokenizer, 0, wandb)
     
     # ========== 9. 清理分布进程 ==========
-    if dist.is_initialized(): dist.destroy_process_group()
+    if dist.is_initialized(): 
+        dist.destroy_process_group()
