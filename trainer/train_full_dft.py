@@ -23,8 +23,12 @@ warnings.filterwarnings('ignore')
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     start_time = time.time()
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
+        # 把数据搬到 GPU
         input_ids = input_ids.to(args.device)
         labels = labels.to(args.device)
+         # 计算当前学习率（余弦退火）
+         #get_lr(当前总步数, 总训练步数, 初始学习率)
+         #epoch：第几轮；iters：一轮有多少个 batch；step：当前 batch
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
@@ -47,27 +51,38 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
         if step % args.log_interval == 0 or step == iters - 1:
             spend_time = time.time() - start_time
+            # 当前总loss（乘回去累积步数）
             current_loss = loss.item() * args.accumulation_steps
+            # 辅助loss
             current_aux_loss = res.aux_loss.item() if res.aux_loss is not None else 0.0
+           # 语言模型本身的loss
             current_logits_loss = current_loss - current_aux_loss
+             # 当前学习率
             current_lr = optimizer.param_groups[-1]['lr']
+            # 预计剩余时间
             eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
             Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min')
             if wandb: wandb.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
-
+         # 每隔一定步数保存模型（只在主进程保存）
         if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
+             # 切换到评估模式
             model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
             ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
+             # 拿到原始模型（去掉DDP/compile包装）
             raw_model = model.module if isinstance(model, DistributedDataParallel) else model
             raw_model = getattr(raw_model, '_orig_mod', raw_model)
             state_dict = raw_model.state_dict()
+            # 保存权重（转FP16并搬到CPU，节省空间）
             torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
+             # 保存断点（续训用）
             lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, 
                          epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints', scaler=scaler)
+            # 切回训练模式
             model.train()
+            # 释放显存
             del state_dict
-
+        # 释放变量显存
         del input_ids, labels, res, loss
 
 
@@ -126,12 +141,17 @@ if __name__ == "__main__":
     if args.use_compile == 1:
         model = torch.compile(model)
         Logger('torch.compile enabled')
+     # 构建SFT数据集
     train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    # 分布式采样器
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
+    # 混合精度梯度缩放器
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
+    # 优化器
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
     
     # ========== 6. 从ckp恢复状态 ==========
+    # 断点续训：恢复模型、优化器、步数
     start_epoch, start_step = 0, 0
     if ckp_data:
         model.load_state_dict(ckp_data['model'])
@@ -147,10 +167,14 @@ if __name__ == "__main__":
     
     # ========== 8. 开始训练 ==========
     for epoch in range(start_epoch, args.epochs):
+        # 分布式随机打乱数据
         train_sampler and train_sampler.set_epoch(epoch)
         setup_seed(42 + epoch); indices = torch.randperm(len(train_ds)).tolist()
+        # 续训时跳过已训练的step
         skip = start_step if (epoch == start_epoch and start_step > 0) else 0
+        # 带跳过功能的batch采样器
         batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)
+        # 构建dataloader
         loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
         if skip > 0: 
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')

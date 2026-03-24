@@ -467,4 +467,6 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
             Logits = logits,
             past_key_values = past_key_values,
             hidden_states=hidden_states)
+    
+
 

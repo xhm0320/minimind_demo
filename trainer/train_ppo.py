@@ -30,6 +30,7 @@ class CriticModel(MiniMindForCausalLM):
     def __init__(self, params):
         super().__init__(params)
         # 替换lm_head为输出单一价值的线性层
+        ## 新增一个线性层，把隐藏层向量映射成 1 个价值分数
         self.value_head = nn.Linear(params.hidden_size, 1)
 
     def forward(self, input_ids=None, attention_mask=None, **kwargs):
@@ -40,14 +41,15 @@ class CriticModel(MiniMindForCausalLM):
         values = self.value_head(hidden_states).squeeze(-1)
         return values
 
-
+# 计算总奖励：格式奖励 + 标记奖励 + 奖励模型奖励
 def calculate_rewards(prompts, responses, reward_model, reward_tokenizer):
     """整合所有奖励函数计算总奖励"""
+     # 子函数：推理模型专用奖励（格式+标签）
     def reasoning_model_reward(rewards):
         # 1. 格式奖励（仅针对训练推理模型时使用）
         pattern = r"^<think>\n.*?\n</think>\n<answer>\n.*?\n</answer>$"
         pattern2 = r"^<think>\n.*?\n</think>\n\n<answer>\n.*?\n</answer>$"
-
+        # 检查每条回答是否符合格式
         matches_pattern = [re.match(pattern, response, re.S) for response in responses]
         matches_pattern2 = [re.match(pattern2, response, re.S) for response in responses]
 
@@ -85,6 +87,7 @@ def calculate_rewards(prompts, responses, reward_model, reward_tokenizer):
         rewards = reasoning_model_reward(rewards)
 
     # 使用reward model计算整个response的奖励
+    # 用奖励模型计算奖励（禁用梯度计算）
     with torch.no_grad():
         reward_model_scores = []
         for prompt, response in zip(prompts, responses):
@@ -94,7 +97,7 @@ def calculate_rewards(prompts, responses, reward_model, reward_tokenizer):
 
             tmp_chat = messages + [{"role": "assistant", "content": response}]
             score = reward_model.get_score(reward_tokenizer, tmp_chat)
-
+            ## 分数截断在 [-scale, scale]
             scale = 3.0
             score = max(min(score, scale), -scale)
 
@@ -107,6 +110,7 @@ def calculate_rewards(prompts, responses, reward_model, reward_tokenizer):
                     tmp_chat = messages + [{"role": "assistant", "content": answer_content}]
                     answer_score = reward_model.get_score(reward_tokenizer, tmp_chat)
                     answer_score = max(min(answer_score, scale), -scale)
+                    # 整体分数占 40%，答案内容占 60%
                     score = score * 0.4 + answer_score * 0.6
             reward_model_scores.append(score)
 
@@ -122,6 +126,7 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_sche
 
     for step, batch in enumerate(loader, start=start_step + 1):
         prompts = batch["prompt"]  # list[str], length B
+        #文字 → 模型能看懂的数字（token）
         enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, 
                        max_length=args.max_seq_len, padding_side="left").to(args.device)  # input_ids: [B, P], attention_mask: [B, P]
         prompt_length = enc.input_ids.shape[1]
@@ -134,15 +139,20 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_sche
                 max_new_tokens=args.max_gen_len, do_sample=True, temperature=0.8,
                 pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id)  # [B, P+R]
 
+        #把生成的 token 转回文字
         responses_text = [tokenizer.decode(gen_out[i, prompt_length:], skip_special_tokens=True) for i in range(len(prompts))]
         rewards = calculate_rewards(prompts, responses_text, reward_model, reward_tokenizer)  # [B]
 
         full_mask = (gen_out != tokenizer.pad_token_id).long()  # [B, P+R]
+        #让裁判模型给整段话预测价值
         values_seq = critic_model(input_ids=gen_out, attention_mask=full_mask)  # [B, P+R]
+        #只取句子最后一个位置的价值分数。
         last_indices = (full_mask * torch.arange(full_mask.size(1), device=gen_out.device)).argmax(dim=1)
         values = values_seq[torch.arange(values_seq.size(0), device=values_seq.device), last_indices]  # [B]
+        #优势 = 实际奖励 - 预测价值
         advantages = rewards - values.detach()  # [B]
 
+         # 混合精度前向
         with autocast_ctx:
             res = actor_model(input_ids=gen_out, attention_mask=full_mask)
             logits = res.logits  # [B, P+R, V]
@@ -151,6 +161,7 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_sche
         labels = gen_out[:, 1:].clone()  # [B, P+R-1]
         logp_tokens = F.log_softmax(logits[:, :-1], dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)  # [B, P+R-1]
         seq_len = gen_out.size(1) - 1
+        #构造 mask：只计算回答部分的损失
         resp_mask = torch.arange(seq_len, device=gen_out.device).unsqueeze(0) >= prompt_length - 1
         final_mask = resp_mask & (~labels.eq(tokenizer.pad_token_id))  # [B, P+R-1]
         actor_logp = (logp_tokens * final_mask).sum(dim=1)  # [B]
@@ -160,20 +171,29 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_sche
             old_logp_tokens = F.log_softmax(old_logits[:, :-1], dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)  # [B, P+R-1]
             old_logp = (old_logp_tokens * final_mask).sum(dim=1)  # [B]
             
+            #计算参考模型概率，防止模型跑偏太远，保持语言模型基本能力
             ref_logits = ref_model(input_ids=gen_out, attention_mask=full_mask).logits  # [B, P+R, V]
             ref_logp_tokens = F.log_softmax(ref_logits[:, :-1], dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)  # [B, P+R-1]
             ref_logp = (ref_logp_tokens * final_mask).sum(dim=1)  # [B]
 
+        #约束模型不要变化太快、太剧烈。
+         # KL 散度：当前模型 vs 旧模型
         kl = (actor_logp - old_logp).mean()  # scalar
+        # KL 散度：当前模型 vs 参考模型
         kl_ref = (actor_logp - ref_logp).mean()  # scalar
+        # PPO 概率比
         ratio = torch.exp(actor_logp - old_logp)  # [B]
+        # PPO 损失
         surr1 = ratio * advantages  # [B]
         surr2 = torch.clamp(ratio, 1.0 - args.clip_epsilon, 1.0 + args.clip_epsilon) * advantages  # [B]
         policy_loss = -torch.min(surr1, surr2).mean()  # scalar
+        # Critic 损失：MSE
         value_loss = F.mse_loss(values, rewards)  # scalar
+        # 总损失 = 策略损失 + 价值损失 + KL惩罚 + MoE损失，再除以累积步数
         loss = (policy_loss + args.vf_coef * value_loss + args.kl_coef * kl_ref + aux_loss) / args.accumulation_steps  # scalar
         loss.backward()
 
+        # 梯度累积：满足步数后更新参数
         if (step + 1) % args.accumulation_steps == 0:
             clip_grad_norm_(actor_model.parameters(), args.grad_clip)
             clip_grad_norm_(critic_model.parameters(), args.grad_clip)
@@ -184,6 +204,7 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_sche
             actor_optimizer.zero_grad()
             critic_optimizer.zero_grad()
 
+         # 主进程打印日志
         if is_main_process():
             response_ids = gen_out[:, enc.input_ids.shape[1]:]
             is_eos = (response_ids == tokenizer.eos_token_id)
@@ -219,6 +240,7 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_sche
                    f"Reward: {reward_val:.4f}, KL: {kl_val:.4f}, KL_ref: {kl_ref_val:.4f}, "
                    f"Avg Response Len: {avg_len_val:.2f}, Actor LR: {actor_lr:.8f}, Critic LR: {critic_lr:.8f}")
 
+        # 定期更新 old_actor
         if (step + 1) % args.update_old_actor_freq == 0:
             raw_actor = actor_model.module if isinstance(actor_model, DistributedDataParallel) else actor_model
             raw_actor = getattr(raw_actor, '_orig_mod', raw_actor)
@@ -226,6 +248,7 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_sche
             old_actor_model.load_state_dict({k: v.detach().cpu() for k, v in state_dict.items()})
             old_actor_model.to(args.device)
 
+        # 定期保存模型
         if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
             actor_model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
@@ -268,7 +291,7 @@ if __name__ == "__main__":
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
     parser.add_argument('--max_seq_len', default=66, type=int, help="Prompt最大长度")
     parser.add_argument("--max_gen_len", type=int, default=1536, help="生成的最大长度")
-    parser.add_argument("--data_path", type=str, default="../dataset/rlaif-mini.jsonl", help="RLAIF数据路径")
+    parser.add_argument("--data_path", type=str, default="../dataset/rlaif-mi ni.jsonl", help="RLAIF数据路径")
     parser.add_argument("--clip_epsilon", type=float, default=0.1, help="PPO裁剪参数")
     parser.add_argument("--vf_coef", type=float, default=0.5, help="Value function系数")
     parser.add_argument("--kl_coef", type=float, default=0.02, help="KL散度惩罚系数")
