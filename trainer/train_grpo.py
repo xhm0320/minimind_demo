@@ -142,7 +142,7 @@ def grpo_train_epoch(epoch, loader, iters, ref_model, reward_model, reward_token
 
         #GRPO 核心：分组优势计算
         # 把同一个prompt的多轮生成分成一组
-        grouped_rewards = rewards.view(-1, args.num_generations)  # [B, num_gen]
+        grouped_rewards = rewards.view(-1, args.num_generations)  # [B, num_gen]#num_generations：一个超参数，含义是生成多少答案
          # 每组均值
         mean_r = grouped_rewards.mean(dim=1).repeat_interleave(args.num_generations)  # [B*num_gen]
         # 每组标准差
